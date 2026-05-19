@@ -58,7 +58,7 @@ class ApplicationSettings: NSStackView {
     private var fanHelperView: PreferencesSection?
     private var remoteView: PreferencesSection?
     
-    private let updateWindow: UpdateWindow = UpdateWindow()
+    private var updateWindow: UpdateWindow?
     private let moduleSelector: ModuleSelectorView = ModuleSelectorView()
     
     private var CPUeButton: NSButton?
@@ -68,6 +68,8 @@ class ApplicationSettings: NSStackView {
     private var CPUeTest: CPUeStressTest = CPUeStressTest()
     private var CPUpTest: CPUpStressTest = CPUpStressTest()
     private var GPUTest: GPUStressTest? = GPUStressTest()
+    
+    private var planField: NSTextField?
     
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: Constants.Settings.width, height: Constants.Settings.height))
@@ -145,9 +147,11 @@ class ApplicationSettings: NSStackView {
             action: #selector(self.toggleRemoteControlState),
             state: Remote.shared.control
         )
-        self.remoteView = PreferencesSection(title: localizedString("Remote (beta)"), [
+        self.planField = textView(Remote.shared.plan?.rawValue.capitalized ?? "Free")
+        self.remoteView = PreferencesSection(title: localizedString("System Stats"), [
             PreferencesRow(localizedString("Authorization"), component: buttonView(#selector(self.loginToRemote), text: localizedString("Login"))),
             PreferencesRow(localizedString("Identificator"), component: textView(Remote.shared.id.uuidString)),
+            PreferencesRow(localizedString("Plan"), component: self.planField!),
             PreferencesRow(localizedString("Monitoring"), component: switchView(
                 action: #selector(self.toggleRemoteMonitoringState),
                 state: Remote.shared.monitoring
@@ -160,6 +164,7 @@ class ApplicationSettings: NSStackView {
         self.remoteView?.setRowVisibility(2, newState: false)
         self.remoteView?.setRowVisibility(3, newState: false)
         self.remoteView?.setRowVisibility(4, newState: false)
+        self.remoteView?.setRowVisibility(5, newState: false)
         
         scrollView.stackView.addArrangedSubview(PreferencesSection(title: localizedString("Settings"), [
             PreferencesRow(
@@ -218,6 +223,8 @@ class ApplicationSettings: NSStackView {
     internal func viewWillAppear() {
         self.startAtLoginBtn?.state = LaunchAtLogin.isEnabled ? .on : .off
         self.remoteControlBtn?.state = Remote.shared.control ? .on : .off
+        
+        self.planField?.stringValue = Remote.shared.plan?.rawValue.capitalized ?? "Free"
         
         var idx = self.updateSelector?.indexOfSelectedItem ?? 0
         if let items = self.updateSelector?.menu?.items {
@@ -297,7 +304,12 @@ class ApplicationSettings: NSStackView {
             }
             
             DispatchQueue.main.async(execute: {
-                self.updateWindow.open(version, settingButton: true)
+                if self.updateWindow == nil {
+                    let w = UpdateWindow()
+                    w.onClose = { [weak self] in self?.updateWindow = nil }
+                    self.updateWindow = w
+                }
+                self.updateWindow?.open(version, settingButton: true)
                 return
             })
         })
@@ -336,6 +348,7 @@ class ApplicationSettings: NSStackView {
         self.combinedModulesView?.setRowVisibility(2, newState: self.combinedModulesState)
         self.combinedModulesView?.setRowVisibility(3, newState: self.combinedModulesState)
         self.combinedModulesView?.setRowVisibility(4, newState: self.combinedModulesState)
+        self.combinedModulesView?.setRowVisibility(5, newState: self.combinedModulesState)
         NotificationCenter.default.post(name: .toggleOneView, object: nil, userInfo: nil)
     }
     
@@ -478,6 +491,7 @@ class ApplicationSettings: NSStackView {
                 self.remoteView?.setRowVisibility(2, newState: true)
                 self.remoteView?.setRowVisibility(3, newState: true)
                 self.remoteView?.setRowVisibility(4, newState: true)
+                self.remoteView?.setRowVisibility(5, newState: true)
                 self.remoteView?.setRowVisibility(0, newState: false)
             } else {
                 self.remoteView?.setRowVisibility(0, newState: true)
@@ -485,6 +499,7 @@ class ApplicationSettings: NSStackView {
                 self.remoteView?.setRowVisibility(2, newState: false)
                 self.remoteView?.setRowVisibility(3, newState: false)
                 self.remoteView?.setRowVisibility(4, newState: false)
+                self.remoteView?.setRowVisibility(5, newState: false)
             }
         }
     }

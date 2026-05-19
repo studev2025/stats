@@ -143,9 +143,13 @@ public class ChartView: NSView {
 }
 
 public class LineChartView: ChartView {
+    private static let xLegendFont = NSFont.systemFont(ofSize: 9, weight: .light)
+    private static let xLegendSampleWidth = "00:00:00".widthOfString(usingFont: xLegendFont)
+    
     private let dateFormatter = DateFormatter()
     
     private var points: [DoubleValue?]
+    private var head: Int = 0
     private var shadowPoints: [DoubleValue?] = []
     private var transparent: Bool = true
     private var flipY: Bool = false
@@ -216,7 +220,7 @@ public class LineChartView: ChartView {
         var fixedScale: Double = 1
         var zeroValue: Double = 0.01
         self.read {
-            originalPoints = self.points
+            originalPoints = self.orderedPointsLocked()
             shadowPoints = self.shadowPoints
             transparent = self.transparent
             flipY = self.flipY
@@ -235,7 +239,10 @@ public class LineChartView: ChartView {
         let points = stop ? shadowPoints : originalPoints
         guard let context = NSGraphicsContext.current?.cgContext, !points.isEmpty else { return }
         context.setShouldAntialias(true)
-        let maxValue = points.compactMap { $0 }.max() ?? 0
+        var maxValue: Double = 0
+        for opt in points {
+            if let p = opt, p.value > maxValue { maxValue = p.value }
+        }
         
         let lineColor: NSColor = color
         var gradientColor: NSColor = color.withAlphaComponent(0.5)
@@ -280,7 +287,7 @@ public class LineChartView: ChartView {
             line.append(point)
             list.append((value: v, point: point))
         }
-        if lines.isEmpty && !line.isEmpty {
+        if !line.isEmpty {
             lines.append(line)
         }
         
@@ -335,13 +342,13 @@ public class LineChartView: ChartView {
         }
         
         if xLegend, list.count >= 2 {
-            let legendFont = NSFont.systemFont(ofSize: 9, weight: .light)
+            let legendFont = LineChartView.xLegendFont
             let legendAttributes: [NSAttributedString.Key: Any] = [
                 .font: legendFont,
                 .foregroundColor: (isDarkMode ? NSColor.white : NSColor.textColor).withAlphaComponent(0.5)
             ]
             
-            let sampleWidth = "00:00:00".widthOfString(usingFont: legendFont)
+            let sampleWidth = LineChartView.xLegendSampleWidth
             let spacing: CGFloat = 8
             let maxLabels = max(2, Int(self.frame.width / (sampleWidth + spacing)))
             let count = min(maxLabels, 5)
@@ -401,13 +408,18 @@ public class LineChartView: ChartView {
         if isTooltipEnabled, let p = self.cursor, !list.isEmpty {
             guard p.y <= height + xLegendHeight else { return }
             
-            let overPoints = list.filter { $0.point.x >= p.x }
-            let underPoints = list.filter { $0.point.x <= p.x }
+            var over: (value: DoubleValue, point: CGPoint)?
+            var overDist: CGFloat = .greatestFiniteMagnitude
+            var under: (value: DoubleValue, point: CGPoint)?
+            var underDist: CGFloat = .greatestFiniteMagnitude
+            for item in list {
+                let d = item.point.x - p.x
+                if d >= 0, d < overDist { over = item; overDist = d }
+                if d <= 0, -d < underDist { under = item; underDist = -d }
+            }
             
-            if let over = overPoints.min(by: { $0.point.x < $1.point.x }), let under = underPoints.max(by: { $0.point.x < $1.point.x }) {
-                let diffOver = over.point.x - p.x
-                let diffUnder = p.x - under.point.x
-                let nearest = (diffOver < diffUnder) ? over : under
+            if let over, let under {
+                let nearest = (overDist < underDist) ? over : under
                 let vLine = NSBezierPath()
                 let hLine = NSBezierPath()
                 
@@ -470,11 +482,58 @@ public class LineChartView: ChartView {
     
     public func addValue(_ value: DoubleValue) {
         self.write {
-            guard !self.points.isEmpty else { return }
-            self.points.remove(at: 0)
-            self.points.append(value)
+            let n = self.points.count
+            guard n > 0 else { return }
+            
+            if let stats = self.intervalStatsLocked() {
+                let gap = value.ts.timeIntervalSince(stats.lastTs)
+                if gap >= 2.0, gap > stats.typical * 1.5 {
+                    let missing = min(Int((gap / stats.typical).rounded()) - 1, n - 1)
+                    for _ in 0..<max(0, missing) {
+                        self.points[self.head] = nil
+                        self.head = (self.head + 1) % n
+                    }
+                }
+            }
+            
+            self.points[self.head] = value
+            self.head = (self.head + 1) % n
         }
         self.displayIfVisible()
+    }
+    
+    private func orderedPointsLocked() -> [DoubleValue?] {
+        let n = self.points.count
+        guard n > 0 else { return [] }
+        var result: [DoubleValue?] = []
+        result.reserveCapacity(n)
+        for i in 0..<n {
+            result.append(self.points[(self.head + i) % n])
+        }
+        return result
+    }
+    
+    private func intervalStatsLocked() -> (lastTs: Date, typical: TimeInterval)? {
+        var deltas: [TimeInterval] = []
+        var prev: Date?
+        var lastTs: Date?
+        let n = self.points.count
+        for i in 0..<n {
+            let p = self.points[(self.head + i) % n]
+            if let p {
+                if let prev {
+                    let d = p.ts.timeIntervalSince(prev)
+                    if d > 0 { deltas.append(d) }
+                }
+                prev = p.ts
+                lastTs = p.ts
+            } else {
+                prev = nil
+            }
+        }
+        guard let lastTs, deltas.count >= 2 else { return nil }
+        deltas.sort()
+        return (lastTs, deltas[deltas.count / 2])
     }
     
     public func addValue(_ value: Double) {
@@ -484,13 +543,15 @@ public class LineChartView: ChartView {
     public func reinit(_ num: Int = 60) {
         self.write {
             guard self.points.count != num else { return }
-            if num < self.points.count {
-                self.points = Array(self.points[self.points.count-num..<self.points.count])
+            let ordered = self.orderedPointsLocked()
+            if num < ordered.count {
+                self.points = Array(ordered.suffix(num))
             } else {
-                let origin = self.points
-                self.points = Array(repeating: nil, count: num)
-                self.points.replaceSubrange(Range(uncheckedBounds: (lower: num-origin.count, upper: num)), with: origin)
+                var arr: [DoubleValue?] = Array(repeating: nil, count: num)
+                arr.replaceSubrange((num-ordered.count)..<num, with: ordered)
+                self.points = arr
             }
+            self.head = 0
         }
         self.displayIfVisible()
     }
@@ -504,7 +565,10 @@ public class LineChartView: ChartView {
     }
     
     public func setPoints(_ newPoints: [DoubleValue]) {
-        self.write { self.points = newPoints.map { Optional($0) } }
+        self.write {
+            self.points = newPoints.map { Optional($0) }
+            self.head = 0
+        }
         self.displayIfVisible()
     }
     
@@ -575,7 +639,7 @@ public class LineChartView: ChartView {
     
     public override func mouseDown(with: NSEvent) {
         guard self.tooltipEnabledSnapshot else { return }
-        self.write { self.shadowPoints = self.points }
+        self.write { self.shadowPoints = self.orderedPointsLocked() }
         self.stop = true
     }
     
@@ -593,7 +657,7 @@ public class NetworkChartView: ChartView {
     private var inChart: LineChartView
     private var outChart: LineChartView
     
-    public init(frame: NSRect, num: Int, minMax: Bool = true, reversedOrder: Bool = false,
+    public init(frame: NSRect = .zero, num: Int, minMax: Bool = true, reversedOrder: Bool = false,
                 outColor: NSColor = .systemRed, inColor: NSColor = .systemBlue, scale: Scale = .none, fixedScale: Double = 1) {
         self.reversedOrder = reversedOrder
         
@@ -1127,14 +1191,25 @@ public class GridChartView: ChartView {
     private let notOkColor: NSColor = .systemRed
     private let inactiveColor: NSColor = .underPageBackgroundColor.withAlphaComponent(0.4)
     
-    private var values: [NSColor] = []
+    private var values: [ColorValue?] = []
     private let grid: (rows: Int, columns: Int)
     
-    public init(frame: NSRect, grid: (rows: Int, columns: Int)) {
+    private let dateFormatter = DateFormatter()
+    private var cursor: NSPoint? = nil
+    
+    public init(frame: NSRect = .zero, grid: (rows: Int, columns: Int)) {
         self.grid = grid
         super.init(frame: frame, queueLabel: "eu.exelban.Stats.Charts.Grid")
         let totalCells = max(grid.rows * grid.columns, 1)
-        self.values = Array(repeating: self.inactiveColor, count: totalCells)
+        self.values = Array(repeating: nil, count: totalCells)
+        
+        self.dateFormatter.dateFormat = "HH:mm:ss"
+        
+        self.addTrackingArea(NSTrackingArea(
+            rect: CGRect(x: 0, y: 0, width: self.frame.width, height: self.frame.height),
+            options: [.activeAlways, .mouseEnteredAndExited, .mouseMoved, .inVisibleRect],
+            owner: self, userInfo: nil
+        ))
     }
     
     required init?(coder: NSCoder) {
@@ -1143,7 +1218,7 @@ public class GridChartView: ChartView {
     
     public override func draw(_ dirtyRect: NSRect) {
         var grid: (rows: Int, columns: Int) = (0, 0)
-        var values: [NSColor] = []
+        var values: [ColorValue?] = []
         self.read {
             grid = self.grid
             values = self.values
@@ -1156,27 +1231,71 @@ public class GridChartView: ChartView {
         )
         var origin: CGPoint = CGPoint(x: 0, y: (size.height + spacing) * CGFloat(grid.columns - 1))
         
+        let cursor = self.cursor
+        var hovered: ColorValue? = nil
+        
         var i: Int = 0
         for _ in 0..<grid.columns {
             for _ in 0..<grid.rows {
-                let box = NSBezierPath(roundedRect: NSRect(origin: origin, size: size), xRadius: 1, yRadius: 1)
-                values[i].setFill()
+                let rect = NSRect(origin: origin, size: size)
+                let box = NSBezierPath(roundedRect: rect, xRadius: 1, yRadius: 1)
+                (values[i]?.color ?? self.inactiveColor).setFill()
                 box.fill()
                 box.close()
+                if let c = cursor, rect.contains(c), let v = values[i] {
+                    hovered = v
+                }
                 i += 1
                 origin.x += size.width + spacing
             }
             origin.x = 0
             origin.y -= size.height + spacing
         }
+        
+        if let v = hovered, let c = cursor {
+            let text = self.dateFormatter.string(from: v.ts)
+            let font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            let tooltipWidth = text.widthOfString(usingFont: font).rounded(.up) + 6
+            let tooltipHeight: CGFloat = 12
+            let tooltipX = c.x + 6 + tooltipWidth > self.frame.size.width
+                ? c.x - tooltipWidth - 6
+                : c.x + 6
+            let tooltipY = c.y + 6
+            drawToolTip(self.frame, CGPoint(x: tooltipX, y: tooltipY), CGSize(width: tooltipWidth, height: tooltipHeight), value: text)
+        }
     }
     
     public func addValue(_ value: Bool) {
         self.write {
             self.values.remove(at: 0)
-            self.values.append(value ? self.okColor : self.notOkColor)
+            self.values.append(ColorValue(value ? 1 : 0, color: value ? self.okColor : self.notOkColor))
         }
         self.displayIfVisible()
+    }
+    
+    public override func mouseEntered(with event: NSEvent) {
+        self.cursor = convert(event.locationInWindow, from: nil)
+        self.needsDisplay = true
+    }
+    
+    public override func mouseMoved(with event: NSEvent) {
+        self.cursor = convert(event.locationInWindow, from: nil)
+        self.needsDisplay = true
+    }
+    
+    public override func mouseExited(with event: NSEvent) {
+        self.cursor = nil
+        self.needsDisplay = true
+    }
+    
+    public override func updateTrackingAreas() {
+        self.trackingAreas.forEach({ self.removeTrackingArea($0) })
+        self.addTrackingArea(NSTrackingArea(
+            rect: CGRect(x: 0, y: 0, width: self.frame.width, height: self.frame.height),
+            options: [.activeAlways, .mouseEnteredAndExited, .mouseMoved, .inVisibleRect],
+            owner: self, userInfo: nil
+        ))
+        super.updateTrackingAreas()
     }
 }
 

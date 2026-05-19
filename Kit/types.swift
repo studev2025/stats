@@ -24,6 +24,7 @@ extension [DoubleValue] {
 }
 
 public struct ColorValue: Equatable {
+    public var ts: Date = Date()
     public let value: Double
     public var color: NSColor?
     
@@ -183,8 +184,18 @@ public struct SColor: KeyValue_p, Equatable {
     public let value: String
     public var additional: Any?
     
+    private static let customPrefix = "custom:"
+    
     public static func == (lhs: SColor, rhs: SColor) -> Bool {
         return lhs.key == rhs.key
+    }
+    
+    public static func custom(_ color: NSColor) -> SColor {
+        return SColor(key: "\(customPrefix)\(color.hexString)", value: "Custom...", additional: color)
+    }
+    
+    public var isCustom: Bool {
+        return self.key.hasPrefix(SColor.customPrefix)
     }
 }
 
@@ -250,7 +261,13 @@ extension SColor: CaseIterable {
     }
     
     public static func fromString(_ key: String, defaultValue: SColor = .systemAccent) -> SColor {
-        return SColor.allCases.first{ $0.key == key } ?? defaultValue
+        if let color = SColor.allCases.first(where: { $0.key == key }) {
+            return color
+        }
+        if key.hasPrefix(customPrefix), let color = NSColor(hex: String(key.dropFirst(customPrefix.count))) {
+            return SColor.custom(color)
+        }
+        return defaultValue
     }
 }
 
@@ -410,7 +427,7 @@ public enum RAMPressure: String, Codable {
         case .normal:
             return NSColor.systemGreen
         case .warning:
-            return NSColor.systemYellow
+            return NSColor.systemOrange
         case .critical:
             return NSColor.systemRed
         }

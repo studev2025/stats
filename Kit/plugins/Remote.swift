@@ -18,6 +18,12 @@ public protocol RemoteType {
     func remote() -> Data?
 }
 
+public enum AccountPlan: String, Codable {
+    case free
+    case pro
+    case team
+}
+
 public class Remote {
     public static let shared = Remote()
     static public var host = URL(string: "https://api.system-stats.com")!
@@ -51,6 +57,7 @@ public class Remote {
     public let id: UUID
     public var isAuthorized: Bool = false
     public var auth: RemoteAuth = RemoteAuth()
+    public var plan: AccountPlan?
     
     private let log: NextLog
     private var mqtt: MQTTManager = MQTTManager()
@@ -253,13 +260,38 @@ public class Remote {
         guard let body = try? JSONEncoder().encode(payload) else { return }
         request.httpBody = body
         
-        self.session.dataTask(with: request) { data, response, _ in
-            guard let httpResponse = response as? HTTPURLResponse else { return }
+        self.session.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self, let httpResponse = response as? HTTPURLResponse else { return }
             if httpResponse.statusCode == 200 {
                 debug("Registered device: \(Remote.shared.id.uuidString)", log: self.log)
+                self.fetchAccount()
             } else {
                 let bodyString = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 debug("Register remote failed (\(httpResponse.statusCode)): \(bodyString)", log: self.log)
+            }
+        }.resume()
+    }
+    
+    private func fetchAccount() {
+        guard let url = URL(string: "\(Remote.host)/account") else { return }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(Remote.shared.auth.accessToken)", forHTTPHeaderField: "Authorization")
+        
+        struct AccountResponse: Codable {
+            let plan: AccountPlan
+        }
+        
+        self.session.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self, let httpResponse = response as? HTTPURLResponse else { return }
+            if httpResponse.statusCode == 200, let data,
+               let account = try? JSONDecoder().decode(AccountResponse.self, from: data) {
+                Remote.shared.plan = account.plan
+                debug("Remote plan: \(account.plan.rawValue)", log: self.log)
+            } else {
+                let bodyString = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                debug("Fetch account failed (\(httpResponse.statusCode)): \(bodyString)", log: self.log)
             }
         }.resume()
     }
@@ -486,7 +518,11 @@ public class RemoteAuth {
     }
     
     public func login(completion: @escaping (URL?) -> Void) {
-        self.registerDevice { device in
+        self.registerDevice { [weak self] device in
+            guard let self else {
+                completion(nil)
+                return
+            }
             guard let device else {
                 completion(nil)
                 return
@@ -497,8 +533,10 @@ public class RemoteAuth {
             self.userCode = device.user_code
             self.interval = device.interval ?? 5
             
-            self.repeater = Repeater(seconds: self.interval) {
-                self.pollForToken { error in
+            self.repeater = Repeater(seconds: self.interval) { [weak self] in
+                guard let self else { return }
+                self.pollForToken { [weak self] error in
+                    guard let self else { return }
                     guard error == nil else {
                         print(error?.localizedDescription ?? "error pooling for token")
                         self.repeater?.pause()
@@ -532,7 +570,11 @@ public class RemoteAuth {
         if let lastTime = self.lastValidationTime, now.timeIntervalSince(lastTime) < dynamicCooldown {
             let remainingTime = dynamicCooldown - now.timeIntervalSince(lastTime)
             self.cooldownLock.unlock()
-            DispatchQueue.main.asyncAfter(deadline: .now() + remainingTime) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + remainingTime) { [weak self] in
+                guard let self else {
+                    completion(false)
+                    return
+                }
                 self.validate(completion)
             }
             return
@@ -661,7 +703,11 @@ public class RemoteAuth {
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
         ])
         
-        self.session.dataTask(with: request) { data, response, error in
+        self.session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else {
+                completion(nil)
+                return
+            }
             if let error = error {
                 completion(error)
                 return
@@ -792,6 +838,11 @@ class MQTTManager: NSObject {
                 self.disconnect()
             }
         }
+    }
+    
+    deinit {
+        self.session?.invalidateAndCancel()
+        self.session = nil
     }
     
     public func connect() {

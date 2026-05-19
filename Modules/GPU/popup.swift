@@ -52,6 +52,10 @@ internal class Popup: PopupWrapper {
         }
     }
     
+    public override func appear() {
+        self.arrangedSubviews.compactMap { $0 as? GPUView }.forEach { $0.appear() }
+    }
+    
     // MARK: - Settings
     
     public override func settings() -> NSView? {
@@ -83,6 +87,7 @@ private class GPUView: NSStackView {
     private var renderUtilizationChart: LineChartView? = nil
     private var tilerUtilizationChart: LineChartView? = nil
     private var aneUtilizationChart: LineChartView? = nil
+    private let cache = PopupCache<GPU_Info>()
     
     public var sizeCallback: (() -> Void)
     
@@ -103,6 +108,15 @@ private class GPUView: NSStackView {
         self.spacing = 0
         self.wantsLayer = true
         self.layer?.cornerRadius = 2
+        
+        self.detailsView.sizeCallback = { [weak self] in
+            guard let self else { return }
+            self.setFrameSize(NSSize(
+                width: self.frame.width,
+                height: self.arrangedSubviews.map({ $0.bounds.height + self.spacing }).reduce(0, +)
+            ))
+            self.sizeCallback()
+        }
         
         self.addArrangedSubview(self.title())
         self.addArrangedSubview(self.stats())
@@ -288,16 +302,7 @@ private class GPUView: NSStackView {
     public func update(_ gpu: GPU_Info) {
         self.detailsView.update(gpu)
         
-        if self.window?.isVisible ?? false {
-            self.stateView?.layer?.backgroundColor = (gpu.state ? NSColor.systemGreen : NSColor.systemRed).cgColor
-            self.stateView?.toolTip = localizedString("GPU \(gpu.state ? "enabled" : "disabled")")
-            
-            self.addStats(id: "GPU temperature", gpu.temperature)
-            self.addStats(id: "GPU utilization", gpu.utilization)
-            self.addStats(id: "Render utilization", gpu.renderUtilization)
-            self.addStats(id: "Tiler utilization", gpu.tilerUtilization)
-            self.addStats(id: "ANE utilization", gpu.aneUtilization)
-        }
+        self.cache.apply(gpu, visible: self.window?.isVisible ?? false, render: self.renderGPU)
         
         if let value = gpu.temperature {
             if let temp = Double(temperature(value).replacingOccurrences(of: "C", with: "").replacingOccurrences(of: "F", with: "").digits) {
@@ -320,6 +325,21 @@ private class GPUView: NSStackView {
         }
     }
     
+    private func renderGPU(_ gpu: GPU_Info) {
+        self.stateView?.layer?.backgroundColor = (gpu.state ? NSColor.systemGreen : NSColor.systemRed).cgColor
+        self.stateView?.toolTip = localizedString("GPU \(gpu.state ? "enabled" : "disabled")")
+        
+        self.addStats(id: "GPU temperature", gpu.temperature)
+        self.addStats(id: "GPU utilization", gpu.utilization)
+        self.addStats(id: "Render utilization", gpu.renderUtilization)
+        self.addStats(id: "Tiler utilization", gpu.tilerUtilization)
+        self.addStats(id: "ANE utilization", gpu.aneUtilization)
+    }
+    
+    public func appear() {
+        self.cache.replay(render: self.renderGPU)
+    }
+    
     @objc private func showDetails() {
         if let view = self.arrangedSubviews.first(where: { $0 is GPUDetails }) {
             view.removeFromSuperview()
@@ -336,6 +356,9 @@ private class GPUView: NSStackView {
 }
 
 private class GPUDetails: NSView {
+    public var sizeCallback: (() -> Void)?
+    
+    private var grid: NSGridView
     private var status: NSTextField? = nil
     private var fanSpeed: NSTextField? = nil
     private var coreClock: NSTextField? = nil
@@ -352,12 +375,14 @@ private class GPUDetails: NSView {
     }
     
     init(width: CGFloat, value: GPU_Info) {
+        self.grid = NSGridView(frame: NSRect(
+            x: Constants.Popup.margins, y: Constants.Popup.margins,
+            width: width - (Constants.Popup.margins*2), height: 0
+        ))
+        
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: 0))
         
-        let grid: NSGridView = NSGridView(frame: NSRect(
-            x: Constants.Popup.margins, y: Constants.Popup.margins,
-            width: self.frame.width - (Constants.Popup.margins*2), height: 0
-        ))
+        let grid = self.grid
         grid.yPlacement = .center
         grid.xPlacement = .leading
         grid.rowSpacing = 0
@@ -484,7 +509,18 @@ private class GPUDetails: NSView {
             self.aneUtilization?.stringValue = "\(Int(value*100))%"
         }
         if let value = gpu.fps {
-            self.fps?.stringValue = "\(Int(value.rounded()))"
+            if let field = self.fps {
+                field.stringValue = "\(Int(value.rounded()))"
+            } else {
+                let arr = self.keyValueRow("\(localizedString("FPS")):", "\(Int(value.rounded()))")
+                self.fps = arr.last
+                self.grid.addRow(with: arr)
+                let height: CGFloat = (16 * CGFloat(self.grid.numberOfRows)) + Constants.Popup.margins
+                self.setFrameSize(NSSize(width: self.frame.width, height: height))
+                self.grid.setFrameSize(NSSize(width: self.grid.frame.width, height: height - Constants.Popup.margins))
+                self.invalidateIntrinsicContentSize()
+                self.sizeCallback?()
+            }
         }
     }
 }

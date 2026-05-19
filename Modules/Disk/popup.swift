@@ -96,6 +96,10 @@ internal class Popup: PopupWrapper {
     
     // MARK: - callbacks
     
+    public override func appear() {
+        self.disks.subviews.compactMap { $0 as? DiskView }.forEach { $0.appear() }
+    }
+    
     internal func capacityCallback(_ value: Disks) {
         defer {
             let h = self.disks.subviews.map({ $0.bounds.height + self.disks.spacing }).reduce(0, +) - self.disks.spacing
@@ -203,12 +207,12 @@ internal class Popup: PopupWrapper {
         ]))
         
         view.addArrangedSubview(PreferencesSection([
-            PreferencesRow(localizedString("Write color"), component: selectView(
+            PreferencesRow(localizedString("Write color"), component: colorSelectView(
                 action: #selector(self.toggleWriteColor),
                 items: SColor.allColors,
                 selected: self.writeColorState.key
             )),
-            PreferencesRow(localizedString("Read color"), component: selectView(
+            PreferencesRow(localizedString("Read color"), component: colorSelectView(
                 action: #selector(self.toggleReadColor),
                 items: SColor.allColors,
                 selected: self.readColorState.key
@@ -231,13 +235,10 @@ internal class Popup: PopupWrapper {
     }
     
     @objc private func toggleWriteColor(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String,
-              let newValue = SColor.allColors.first(where: { $0.key == key }) else {
-            return
-        }
-        self.writeColorState = newValue
-        Store.shared.set(key: "\(self.title)_writeColor", value: key)
-        if let color = newValue.additional as? NSColor {
+        guard let key = sender.representedObject as? String else { return }
+        self.writeColorState = SColor.fromString(key, defaultValue: self.writeColorState)
+        Store.shared.set(key: "\(self.title)_writeColor", value: self.writeColorState.key)
+        if let color = self.writeColorState.additional as? NSColor {
             self.processes?.setColor(1, color)
             for view in self.disks.subviews.filter({ $0 is DiskView }).map({ $0 as! DiskView }) {
                 view.setChartColor(write: color)
@@ -245,13 +246,10 @@ internal class Popup: PopupWrapper {
         }
     }
     @objc private func toggleReadColor(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String,
-              let newValue = SColor.allColors.first(where: { $0.key == key }) else {
-            return
-        }
-        self.readColorState = newValue
-        Store.shared.set(key: "\(self.title)_readColor", value: key)
-        if let color = newValue.additional as? NSColor {
+        guard let key = sender.representedObject as? String else { return }
+        self.readColorState = SColor.fromString(key, defaultValue: self.readColorState)
+        Store.shared.set(key: "\(self.title)_readColor", value: self.readColorState.key)
+        if let color = self.readColorState.additional as? NSColor {
             self.processes?.setColor(0, color)
             for view in self.disks.subviews.filter({ $0 is DiskView }).map({ $0 as! DiskView }) {
                 view.setChartColor(read: color)
@@ -357,6 +355,12 @@ internal class DiskView: NSStackView {
         self.detailsView.update(smart: smart)
     }
     
+    public func appear() {
+        self.nameView.appear()
+        self.legendView.appear()
+        self.detailsView.appear()
+    }
+    
     public func updateStats(stats: stats) {
         self.nameView.update(free: nil, read: stats.read, write: stats.write)
         self.chartView.update(read: stats.read, write: stats.write)
@@ -389,7 +393,7 @@ internal class NameView: NSStackView {
     private let size: Int64
     private let uri: URL?
     private let finder: URL?
-    private var ready: Bool = false
+    private let cache = PopupCache<(read: Int64?, write: Int64?)>()
     
     private var readState: NSView? = nil
     private var writeState: NSView? = nil
@@ -485,17 +489,23 @@ internal class NameView: NSStackView {
     }
     
     public func update(free: Int64?, read: Int64?, write: Int64?) {
-        if (self.window?.isVisible ?? false) || !self.ready {
-            if let read = read {
-                self.readState?.toolTip = "Read: \(Units(bytes: read).getReadableSpeed())"
-                self.readState?.layer?.backgroundColor = read != 0 ? self.readColor.cgColor : NSColor.lightGray.withAlphaComponent(0.75).cgColor
-            }
-            if let write = write {
-                self.writeState?.toolTip = "Write: \(Units(bytes: write).getReadableSpeed())"
-                self.writeState?.layer?.backgroundColor = write != 0 ? self.writeColor.cgColor : NSColor.lightGray.withAlphaComponent(0.75).cgColor
-            }
-            self.ready = true
+        guard read != nil || write != nil else { return }
+        self.cache.apply((read, write), visible: self.window?.isVisible ?? false, render: self.renderActivity)
+    }
+    
+    private func renderActivity(_ value: (read: Int64?, write: Int64?)) {
+        if let read = value.read {
+            self.readState?.toolTip = "Read: \(Units(bytes: read).getReadableSpeed())"
+            self.readState?.layer?.backgroundColor = read != 0 ? self.readColor.cgColor : NSColor.lightGray.withAlphaComponent(0.75).cgColor
         }
+        if let write = value.write {
+            self.writeState?.toolTip = "Write: \(Units(bytes: write).getReadableSpeed())"
+            self.writeState?.layer?.backgroundColor = write != 0 ? self.writeColor.cgColor : NSColor.lightGray.withAlphaComponent(0.75).cgColor
+        }
+    }
+    
+    public func appear() {
+        self.cache.replay(render: self.renderActivity)
     }
     
     @objc private func openDisk() {
@@ -573,7 +583,7 @@ private class LegendView: NSView {
     private let size: Int64
     private var free: Int64
     private let id: String
-    private var ready: Bool = false
+    private let cache = PopupCache<Int64>()
     
     private var showUsedSpace: Bool {
         get { Store.shared.bool(key: "\(self.id)_usedSpace", defaultValue: false) }
@@ -629,17 +639,20 @@ private class LegendView: NSView {
     
     public func update(free: Int64) {
         self.free = free
-        
-        if (self.window?.isVisible ?? false) || !self.ready {
-            if let view = self.legendField {
-                view.stringValue = self.legend(free: free)
-            }
-            if let view = self.percentageField {
-                view.stringValue = self.percentage(free: free)
-            }
-            
-            self.ready = true
+        self.cache.apply(free, visible: self.window?.isVisible ?? false, render: self.renderLegend)
+    }
+    
+    private func renderLegend(_ free: Int64) {
+        if let view = self.legendField {
+            view.stringValue = self.legend(free: free)
         }
+        if let view = self.percentageField {
+            view.stringValue = self.percentage(free: free)
+        }
+    }
+    
+    public func appear() {
+        self.cache.replay(render: self.renderLegend)
     }
     
     private func legend(free: Int64) -> String {
@@ -710,6 +723,9 @@ internal class DetailsView: NSStackView {
     private var healthValueField: ValueField?
     private var powerCyclesValueField: ValueField?
     private var powerOnHoursValueField: ValueField?
+    
+    private let statsCache = PopupCache<stats>()
+    private let smartCache = PopupCache<smart_t>()
     
     private var readColor: NSColor {
         SColor.fromString(Store.shared.string(key: "\(ModuleType.disk.stringValue)_readColor", defaultValue: SColor.secondBlue.key)).additional as! NSColor
@@ -802,11 +818,13 @@ internal class DetailsView: NSStackView {
     }
     
     public func update(stats: stats) {
-        guard self.window?.isVisible ?? false else { return }
-        
+        self.statsCache.apply(stats, visible: self.window?.isVisible ?? false, render: self.renderStats)
+    }
+    
+    private func renderStats(_ stats: stats) {
         self.readSpeedValueField?.stringValue = Units(bytes: stats.read).getReadableSpeed()
         self.writeSpeedValueField?.stringValue = Units(bytes: stats.write).getReadableSpeed()
-        
+
         self.totalReadValueField?.stringValue = Units(bytes: stats.readBytes).getReadableMemory()
         self.totalReadValueField?.toolTip = "\(stats.readBytes / (512 * 1000))"
         self.totalWrittenValueField?.stringValue = Units(bytes: stats.writeBytes).getReadableMemory()
@@ -814,8 +832,11 @@ internal class DetailsView: NSStackView {
     }
     
     public func update(smart: smart_t?) {
-        guard self.window?.isVisible ?? false, let smart else { return }
-        
+        guard let smart else { return }
+        self.smartCache.apply(smart, visible: self.window?.isVisible ?? false, render: self.renderSmart)
+    }
+    
+    private func renderSmart(_ smart: smart_t) {
         self.smartTotalReadValueField?.toolTip = "\(smart.totalRead / (512 * 1000))"
         self.smartTotalWrittenValueField?.toolTip = "\(smart.totalWritten / (512 * 1000))"
         self.smartTotalReadValueField?.stringValue = Units(bytes: smart.totalRead).getReadableMemory()
@@ -826,5 +847,10 @@ internal class DetailsView: NSStackView {
         
         self.powerCyclesValueField?.stringValue = "\(smart.powerCycles)"
         self.powerOnHoursValueField?.stringValue = "\(smart.powerOnHours)"
+    }
+    
+    public func appear() {
+        self.statsCache.replay(render: self.renderStats)
+        self.smartCache.replay(render: self.renderSmart)
     }
 }
